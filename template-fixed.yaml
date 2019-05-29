@@ -1,0 +1,137 @@
+---
+AWSTemplateFormatVersion: '2010-09-09'
+Description: S3 Batch PoC
+Parameters:
+  ManifestKey:
+    Type: String
+    Description: A name of manifest file
+    Default: 'manifest.csv'
+
+Resources:
+
+  SourceBucket:
+    Type: AWS::S3::Bucket
+  ManifestBucket:
+    Type: AWS::S3::Bucket
+  ReportBucket:
+    Type: AWS::S3::Bucket
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      - arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess
+      Policies:
+      - PolicyName: S3batch
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - s3:CreateJob
+            Resource: "*"
+          - Effect: Allow
+            Action:
+            - iam:GetRole
+            - iam:PassRole
+            Resource:
+              Fn::GetAtt:
+              - S3BatchExecutionRole
+              - Arn
+
+  # The role taken from AWS documentation:
+  # https://docs.aws.amazon.com/AmazonS3/latest/dev/batch-ops-iam-role-policies.html
+  S3BatchExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - batchoperations.s3.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Policies:
+      - PolicyName: restore
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - s3:RestoreObject
+            Resource: !Sub "arn:aws:s3:::${SourceBucket}/*"
+          - Effect: Allow
+            Action:
+            - s3:GetObject
+            - s3:GetObjectVersion
+            - s3:GetBucketLocation
+            Resource: !Sub "arn:aws:s3:::${ManifestBucket}/*"
+          - Effect: Allow
+            Action:
+            - s3:PutObject
+            - s3:GetBucketLocation
+            Resource: !Sub "arn:aws:s3:::${ReportBucket}/*"
+
+  LambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          import os, boto3
+          s3 = boto3.client('s3')
+          s3_ctrl = boto3.client('s3control')
+          def handler(event, context):
+            manifest = s3.head_object(Bucket=os.environ['MANIFEST_BUCKET'], Key=os.environ['MANIFEST_KEY'])
+            api_response = s3_ctrl.create_job(
+                ConfirmationRequired=False,
+                AccountId=context.invoked_function_arn.split(':')[4],
+                RoleArn=os.environ['ROLE_ARN'],
+                Priority=10,
+                Report={"Bucket": os.environ['REPORT_BUCKET'], "Format": 'Report_CSV_20180820', "ReportScope": 'AllTasks', "Enabled": True },
+                Operation={"S3InitiateRestoreObject": {"ExpirationInDays": 1, "GlacierJobTier": 'STANDARD' }},
+                Manifest={"Spec": {"Format": "S3BatchOperations_CSV_20180820", "Fields": ["Bucket", "Key"] },
+                          "Location": {"ObjectArn": 'arn:aws:s3:::{}/{}'.format(os.environ['MANIFEST_BUCKET'], os.environ['MANIFEST_KEY']), "ETag": manifest['ETag'].strip('"') }})
+            print(api_response)
+            return {
+                'message' : 'success'
+            }
+      Environment:
+        Variables:
+          SOURCE_BUCKET: !Ref SourceBucket
+          MANIFEST_BUCKET: !Ref ManifestBucket
+          MANIFEST_KEY: !Ref ManifestKey
+          REPORT_BUCKET: !GetAtt
+            - ReportBucket
+            - Arn
+          ROLE_ARN: !GetAtt
+            - S3BatchExecutionRole
+            - Arn
+      Handler: index.handler
+      Role: !GetAtt
+        - LambdaExecutionRole
+        - Arn
+      Runtime: python3.6
+      Layers:
+        - arn:aws:lambda:us-east-1:085576722239:layer:boto3:2
+
+Outputs:
+  SourceBucket:
+    Value: !Ref SourceBucket
+  ManifestBucket:
+    Value: !Ref ManifestBucket
+  ReportBucket:
+    Value: !Ref ReportBucket
+  LambdaFunction:
+    Value: !Ref LambdaFunction
